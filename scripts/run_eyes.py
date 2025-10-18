@@ -5,7 +5,10 @@ Loop principal de la instalación: captura, tracking y render de ojos.
 from __future__ import annotations
 
 import argparse
+import platform
+import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -23,10 +26,166 @@ from luna_eyes.filtering import OneEuroFilter
 from luna_eyes.render import EyeRenderConfig, EyeRenderer
 from luna_eyes.tracking import PersonDetection, PersonTracker
 
+IS_WINDOWS = platform.system() == "Windows"
+WINDOWS_BACKEND = getattr(cv2, "CAP_DSHOW", None) if IS_WINDOWS else None
+
+
+@dataclass
+class CameraSource:
+    label: str
+    value: int | str
+    backend: Optional[int] = None
+
+
+def _create_capture(source: CameraSource) -> cv2.VideoCapture:
+    if source.backend is not None:
+        return cv2.VideoCapture(source.value, source.backend)
+    return cv2.VideoCapture(source.value)
+
+
+def _windows_camera_names() -> list[str]:
+    if not IS_WINDOWS:
+        return []
+    command = [
+        "powershell",
+        "-NoProfile",
+        "-Command",
+        "Get-CimInstance Win32_PnPEntity | Where-Object { $_.PNPClass -eq 'Camera' } | Select-Object -ExpandProperty Name",
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=True)
+    except Exception:
+        return []
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def enumerate_camera_sources(max_devices: int) -> list[CameraSource]:
+    options: list[CameraSource] = []
+    seen: set[tuple[str, str]] = set()
+    backend = WINDOWS_BACKEND
+
+    for name in _windows_camera_names():
+        source_value = name if name.startswith("video=") else f"video={name}"
+        camera = CameraSource(label=name, value=source_value, backend=backend)
+        cap = _create_capture(camera)
+        if cap.isOpened():
+            options.append(camera)
+            seen.add(("name", source_value))
+        cap.release()
+
+    for index in range(max_devices):
+        camera = CameraSource(label=f"Cámara {index}", value=index, backend=backend)
+        cap = _create_capture(camera)
+        if cap.isOpened() and ("index", str(index)) not in seen:
+            options.append(camera)
+            seen.add(("index", str(index)))
+        cap.release()
+
+    return options
+
+
+def preview_camera(option: CameraSource, timeout: float = 8.0) -> None:
+    cap = _create_capture(option)
+    if not cap.isOpened():
+        print(f"No se pudo abrir la cámara para vista previa: {option.label}")
+        return
+    print("Vista previa (ESC o Q para cerrar)...")
+    cv2.namedWindow("camera-preview", cv2.WINDOW_NORMAL)
+    end_time = time.perf_counter() + timeout
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                print("No se pudo leer fotogramas de la cámara seleccionada.")
+                break
+            cv2.imshow("camera-preview", frame)
+            key = cv2.waitKey(1) & 0xFF
+            if key in (27, ord("q"), ord("Q")):
+                break
+            if time.perf_counter() > end_time:
+                break
+    finally:
+        cap.release()
+        cv2.destroyWindow("camera-preview")
+
+
+def prompt_for_camera(max_devices: int) -> CameraSource:
+    options = enumerate_camera_sources(max_devices)
+    if not options:
+        raise RuntimeError("No se detectaron cámaras disponibles.")
+
+    print("Cámaras detectadas:")
+    for idx, option in enumerate(options):
+        print(f"  [{idx}] {option.label}")
+    print("Introduce el número de la cámara a usar.")
+    print("Escribe 'p<N>' para ver una vista previa (ejemplo: p1) o pulsa ENTER para elegir [0].")
+
+    while True:
+        raw = input("Selección [0]: ").strip().lower()
+        if raw == "":
+            selection = 0
+            break
+        if raw.startswith("p"):
+            preview_idx = raw[1:]
+            if preview_idx.isdigit():
+                idx = int(preview_idx)
+                if 0 <= idx < len(options):
+                    preview_camera(options[idx])
+                    continue
+            print("Formato de vista previa inválido. Usa p0, p1, etc.")
+            continue
+        if raw.isdigit():
+            selection = int(raw)
+            if 0 <= selection < len(options):
+                break
+        print("Entrada inválida, intenta de nuevo.")
+
+    chosen = options[selection]
+    print(f"Seleccionado: {chosen.label}")
+    return chosen
+
+
+def resolve_camera(camera_arg: Optional[str], max_devices: int) -> CameraSource:
+    backend = WINDOWS_BACKEND
+    if camera_arg is None:
+        return prompt_for_camera(max_devices)
+
+    raw = camera_arg.strip()
+    if raw == "":
+        return prompt_for_camera(max_devices)
+
+    lowered = raw.lower()
+    if lowered in {"prompt", "select"}:
+        return prompt_for_camera(max_devices)
+
+    if raw.isdigit():
+        index = int(raw)
+        return CameraSource(label=f"Cámara {index}", value=index, backend=backend)
+
+    if raw.startswith("video="):
+        label = raw[6:] or raw
+        return CameraSource(label=label, value=raw, backend=backend)
+
+    value = f"video={raw}" if IS_WINDOWS else raw
+    return CameraSource(label=raw, value=value, backend=backend)
+
+
+def setup_camera(camera: CameraSource) -> cv2.VideoCapture:
+    cap = _create_capture(camera)
+    if not cap.isOpened():
+        raise RuntimeError(f"No se pudo abrir la cámara {camera.label}")
+    print(f"Usando cámara: {camera.label}")
+    return cap
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Proyecta ojos que siguen a la audiencia.")
-    parser.add_argument("--camera", type=int, default=0, help="Índice de la cámara (default: 0)")
+    parser.add_argument(
+        "--camera",
+        type=str,
+        default=None,
+        help="Índice (0, 1, ...) o nombre de la cámara. Usa 'prompt' para seleccionar de una lista interactiva.",
+    )
     parser.add_argument("--model", type=str, default="yolo11n.pt", help="Modelo YOLO a usar")
     parser.add_argument("--device", type=str, default=None, help="Dispositivo (cpu, cuda:0, mps, ...)")
     parser.add_argument("--conf", type=float, default=0.35, help="Confianza mínima YOLO")
@@ -41,15 +200,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-cutoff", type=float, default=1.2, help="Valor inicial min_cutoff del filtro")
     parser.add_argument("--beta", type=float, default=0.05, help="Valor inicial beta del filtro")
     parser.add_argument("--pupil-offset", type=float, default=0.35, help="Desplazamiento máximo relativo de pupila")
+    parser.add_argument("--max-camera-scan", type=int, default=6, help="Número máximo de índices a escanear al listar cámaras.")
+    parser.add_argument("--flip-x", action="store_true", help="Invierte el movimiento horizontal de las pupilas.")
+    parser.add_argument("--flip-y", action="store_true", help="Invierte el movimiento vertical de las pupilas.")
     return parser.parse_args()
-
-
-def setup_camera(index: int) -> cv2.VideoCapture:
-    cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
-    if not cap.isOpened():
-        raise RuntimeError(f"No se pudo abrir la cámara {index}")
-    return cap
-
 
 def setup_controls(initial_min_cutoff: float, initial_beta: float, initial_offset: float) -> None:
     cv2.namedWindow("controls", cv2.WINDOW_NORMAL)
@@ -98,6 +252,8 @@ def main() -> None:
     if args.homography:
         homography = load_homography(args.homography)
 
+    camera_source = resolve_camera(args.camera, args.max_camera_scan)
+
     tracker = PersonTracker(
         model_path=args.model,
         device=args.device,
@@ -115,7 +271,7 @@ def main() -> None:
     filter_x = OneEuroFilter(freq=args.initial_freq, min_cutoff=args.min_cutoff, beta=args.beta)
     filter_y = OneEuroFilter(freq=args.initial_freq, min_cutoff=args.min_cutoff, beta=args.beta)
 
-    cap = setup_camera(args.camera)
+    cap = setup_camera(camera_source)
 
     cv2.namedWindow("eyes", cv2.WINDOW_NORMAL)
     if args.fullscreen:
@@ -145,6 +301,11 @@ def main() -> None:
                 nx, ny = detection_to_screen(detection, frame.shape, renderer_cfg, homography)
             else:
                 nx, ny = 0.0, 0.0
+
+            if args.flip_x:
+                nx = -nx
+            if args.flip_y:
+                ny = -ny
 
             if args.controls:
                 min_cutoff, beta, pupil_offset = read_controls(args.min_cutoff, args.beta, renderer_cfg.pupil_max_offset)

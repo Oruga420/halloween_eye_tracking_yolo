@@ -27,3 +27,7 @@ Sistema interactivo para proyectar ojos que siguen a la persona más prominente 
    ```
 
 Configura los sliders en la ventana de debug para ajustar suavizado, límites y velocidad de los ojos en tiempo real.
+
+### Consejos
+
+- Si notas que los ojos se mueven al revés que la audiencia, añade `--flip-x` (y/o `--flip-y`) al comando para invertir el movimiento horizontal o vertical.
