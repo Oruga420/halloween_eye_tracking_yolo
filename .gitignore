@@ -1,0 +1,21 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+build/
+dist/
+*.log
+
+# User-specific calibration and assets
+data/*
+!data/.gitkeep
+*.npy
+
+# Pretrained weights downloaded at runtime
+*.pt
+
+# IDE metadata
+.vscode/
+.idea/
